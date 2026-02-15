@@ -1,510 +1,300 @@
 #!/usr/bin/env python
 """
-SO101 Inverse Kinematics Control - Move the arm using Cartesian positions.
+SO101 Inverse Kinematics Control - Move the arm to a Cartesian position.
 
 Usage:
-    python scripts/test_so101_ik.py --port /dev/ttyACM0
-    python scripts/test_so101_ik.py --port /dev/ttyACM0 --interactive
-    python scripts/test_so101_ik.py --port /dev/ttyACM0 -i --cam1 0 --cam2 2
+    python scripts/test_so101_ik.py --port /dev/ttyACM0 goto 400 0 200
+    python scripts/test_so101_ik.py --port /dev/ttyACM0 --no-cameras goto 400 0 200
+    python scripts/test_so101_ik.py --port /dev/ttyACM0 --dataset user/so101_recover recover 10 40
+    python scripts/test_so101_ik.py --port /dev/ttyACM0 --no-cameras deploy outputs/train/.../last/pretrained_model 5 30
 """
 
 import argparse
+import math
+import shutil
 import time
-import threading
 
+import cv2
 import numpy as np
 
-from lerobot.model.kinematics import RobotKinematics
-from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
-
-URDF_PATH = "SO101/so101_new_calib.urdf"
 IK_JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
+ALL_JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
+
+# Analytical kinematics constants (from URDF geometry analysis)
+PAN_CENTER_X = 38.8   # Pan rotation center X offset (mm)
+PIVOT_R = 30.4         # Shoulder pivot radial offset from pan center (mm)
+PIVOT_Z = 116.6        # Shoulder pivot height (mm)
+L1 = 116.0             # Upper arm length (mm)
+L2 = 135.0             # Lower arm length (mm)
+L3 = 160.5             # Wrist to gripper tip (mm)
+A1_BASE = 76.0         # Upper arm angle at SL=0 (deg from horizontal)
+A2_OFFSET = 73.8       # Angle offset between L1 and L2 at EF=0
+A3_OFFSET = 5.0        # Angle offset between L2 and L3 at WF=0
+
+# Camera configuration
+CAMERAS = {
+    "front": {"index": 4, "width": 320, "height": 240, "fps": 30},
+    "wrist": {"index": 6, "width": 640, "height": 360, "fps": 30},
+}
 
 
 # =============================================================================
 # Kinematics
 # =============================================================================
 
-def get_kinematics():
-    return RobotKinematics(urdf_path=URDF_PATH, target_frame_name="gripper_frame_link", joint_names=IK_JOINTS)
-
-
-def get_current_joints(robot) -> np.ndarray:
-    obs = robot.get_observation()
+def joints_from_obs(obs) -> np.ndarray:
+    """Extract IK joint angles from a robot observation."""
     return np.array([obs[f"{j}.pos"] for j in IK_JOINTS])
 
 
-def get_ee_pose(kin, joints):
-    T = kin.forward_kinematics(joints)
-    return T[:3, 3], T
+def analytical_fk(joints_deg):
+    """Forward kinematics using analytical model. Returns XYZ in mm."""
+    pan, sl, ef, wf, wr = joints_deg
+
+    a1 = math.radians(A1_BASE - sl)
+    a2 = math.radians(A1_BASE - A2_OFFSET - sl - ef)
+    a3 = math.radians(A1_BASE - A2_OFFSET - A3_OFFSET - sl - ef - wf)
+
+    tip_r = PIVOT_R + L1*math.cos(a1) + L2*math.cos(a2) + L3*math.cos(a3)
+    tip_z = PIVOT_Z + L1*math.sin(a1) + L2*math.sin(a2) + L3*math.sin(a3)
+
+    pan_rad = math.radians(pan)
+    x = PAN_CENTER_X + tip_r * math.cos(pan_rad)
+    y = -tip_r * math.sin(pan_rad)
+    return np.array([x, y, tip_z])
 
 
-def solve_ik_generic(kin, current_joints, target_pos, iterations=5):
-    """Generic IK - maintains current orientation."""
-    T_target = np.eye(4)
-    T_target[:3, 3] = target_pos
-    T_target[:3, :3] = kin.forward_kinematics(current_joints)[:3, :3]
-
-    result = current_joints.copy()
-    for _ in range(iterations):
-        result = kin.inverse_kinematics(result, T_target, position_weight=1.0, orientation_weight=0.01)
-    return result
-
-
-def solve_ik_pointing_down(kin, target_xyz, max_tilt_deg: float = 25.0, initial_guess=None):
+def analytical_ik(target_pos_mm, current_wf, current_wr):
     """
-    IK with gripper pointing down. Allows tilt up to max_tilt_deg from vertical.
-    Returns: (joints, error_mm, tilt_deg)
+    Analytical IK for SO101 arm. Returns joint angles in degrees.
+
+    Solves shoulder_pan analytically, then uses effective-link 2-link IK
+    for shoulder_lift and elbow_flex. Keeps wrist_flex and wrist_roll unchanged.
+
+    Deterministic: same input always gives the same output.
     """
-    best_joints = initial_guess if initial_guess is not None else np.zeros(5)
-    best_error = float('inf')
-    
-    # Coarse search
-    for pan in np.linspace(-70, 70, 22):
-        for lift in np.linspace(0, 100, 22):
-            for elbow in np.linspace(-80, 80, 22):
-                for wrist_flex in np.linspace(-100, 100, 22):
-                    pitch_sum = lift + elbow + wrist_flex
-                    if abs(pitch_sum - 90) > max_tilt_deg:
-                        continue
-                    
-                    joints = np.array([pan, lift, elbow, wrist_flex, 0.0])
-                    T = kin.forward_kinematics(joints)
-                    error = np.linalg.norm(T[:3, 3] - target_xyz)
-                    cost = error + abs(pitch_sum - 90) * 0.00005
-                    
-                    if cost < best_error:
-                        best_error = cost
-                        best_joints = joints.copy()
-    
-    # Refine
-    p0, l0, e0, w0 = best_joints[:4]
-    for pan in np.linspace(p0-6, p0+6, 12):
-        for lift in np.linspace(l0-6, l0+6, 12):
-            for elbow in np.linspace(e0-6, e0+6, 12):
-                for wrist_flex in np.linspace(w0-6, w0+6, 12):
-                    pitch_sum = lift + elbow + wrist_flex
-                    if abs(pitch_sum - 90) > max_tilt_deg:
-                        continue
-                    
-                    joints = np.array([pan, lift, elbow, wrist_flex, 0.0])
-                    T = kin.forward_kinematics(joints)
-                    error = np.linalg.norm(T[:3, 3] - target_xyz)
-                    
-                    if error < best_error:
-                        best_error = error
-                        best_joints = joints.copy()
-    
-    T_final = kin.forward_kinematics(best_joints)
-    z_axis = T_final[:3, 2]
-    tilt = np.degrees(np.arccos(max(-1, min(1, -z_axis[2])))) if z_axis[2] < 0 else 90
-    
-    return best_joints, best_error * 1000, tilt
+    tx, ty, tz = target_pos_mm
 
+    pan = math.degrees(math.atan2(-ty, tx - PAN_CENTER_X))
 
-# =============================================================================
-# Motion
-# =============================================================================
-
-# Global gripper target - when set, all moves will maintain this grip
-_gripper_target = None
-
-
-def set_gripper_target(value):
-    """Set the desired gripper position. All moves will maintain this."""
-    global _gripper_target
-    _gripper_target = value
-
-
-def get_gripper_target(robot):
-    """Get gripper value to command - uses target if set, else current position."""
-    global _gripper_target
-    if _gripper_target is not None:
-        return _gripper_target
-    return robot.get_observation()["gripper.pos"]
-
-
-def move_smooth(robot, target_joints, duration=1.0, steps=20):
-    """Basic joint-space interpolation (open-loop)."""
-    current = get_current_joints(robot)
-    gripper = get_gripper_target(robot)
-
-    for i in range(steps + 1):
-        t = (i / steps) ** 2 * (3 - 2 * i / steps)
-        interp = current + (target_joints - current) * t
-        action = {f"{j}.pos": interp[k] for k, j in enumerate(IK_JOINTS)}
-        action["gripper.pos"] = gripper
-        robot.send_action(action)
-        time.sleep(duration / steps)
-
-
-def move_cartesian(robot, kin, target_xyz, ik_func, duration=1.0, steps=15, **ik_kwargs):
-    """
-    Cartesian-space interpolation - interpolates in XYZ, solves IK at each step.
-    Produces straighter paths than joint interpolation.
-    """
-    current_joints = get_current_joints(robot)
-    start_xyz, _ = get_ee_pose(kin, current_joints)
-    gripper = get_gripper_target(robot)
-    
-    prev_joints = current_joints
-    for i in range(steps + 1):
-        t = i / steps
-        t = t * t * (3 - 2 * t)  # ease in-out
-        
-        # Interpolate in Cartesian space
-        xyz = start_xyz + (target_xyz - start_xyz) * t
-        
-        # Solve IK for this intermediate point
-        if ik_func == solve_ik_pointing_down:
-            joints, _, _ = ik_func(kin, xyz, initial_guess=prev_joints, **ik_kwargs)
-        else:
-            joints = ik_func(kin, prev_joints, xyz, **ik_kwargs)
-        
-        action = {f"{j}.pos": joints[k] for k, j in enumerate(IK_JOINTS)}
-        action["gripper.pos"] = gripper
-        robot.send_action(action)
-        prev_joints = joints
-        time.sleep(duration / steps)
-    
-    return prev_joints
-
-
-def move_corrected(robot, kin, target_xyz, ik_func, threshold_mm=2.0, max_attempts=5, **ik_kwargs):
-    """
-    Closed-loop correction - moves to target, reads actual position, corrects if needed.
-    More accurate but slower than open-loop.
-    """
-    gripper = get_gripper_target(robot)
-    
-    for attempt in range(max_attempts):
-        # Read actual position
-        actual_joints = get_current_joints(robot)
-        actual_xyz, _ = get_ee_pose(kin, actual_joints)
-        
-        error = np.linalg.norm(actual_xyz - target_xyz) * 1000
-        if error < threshold_mm:
-            return actual_joints, error, attempt + 1
-        
-        # Compute correction from actual position
-        if ik_func == solve_ik_pointing_down:
-            target_joints, _, _ = ik_func(kin, target_xyz, initial_guess=actual_joints, **ik_kwargs)
-        else:
-            target_joints = ik_func(kin, actual_joints, target_xyz, **ik_kwargs)
-        
-        # Move (shorter duration for corrections)
-        dur = 0.5 if attempt == 0 else 0.3
-        current = actual_joints
-        for i in range(10):
-            t = (i + 1) / 10
-            interp = current + (target_joints - current) * t
-            action = {f"{j}.pos": interp[k] for k, j in enumerate(IK_JOINTS)}
-            action["gripper.pos"] = gripper
-            robot.send_action(action)
-            time.sleep(dur / 10)
-        
-        time.sleep(0.1)  # Let it settle
-    
-    # Final check
-    actual_joints = get_current_joints(robot)
-    actual_xyz, _ = get_ee_pose(kin, actual_joints)
-    error = np.linalg.norm(actual_xyz - target_xyz) * 1000
-    return actual_joints, error, max_attempts
-
-
-# =============================================================================
-# Shapes
-# =============================================================================
-
-def generate_shape(shape, cx, cy, z, size):
-    """Generate waypoints (meters)."""
-    if shape == "square":
-        hs = size / 2
-        return [
-            np.array([cx - hs, cy - hs, z]), np.array([cx - hs, cy + hs, z]),
-            np.array([cx + hs, cy + hs, z]), np.array([cx + hs, cy - hs, z]),
-            np.array([cx - hs, cy - hs, z]),
-        ]
-    elif shape == "circle":
-        angles = np.linspace(0, 2 * np.pi, 17)
-        r = size / 2
-        return [np.array([cx + r * np.cos(a), cy + r * np.sin(a), z]) for a in angles]
-    elif shape == "triangle":
-        r = size / np.sqrt(3)
-        return [np.array([cx + r * np.cos(np.pi/2 + i * 2*np.pi/3), 
-                         cy + r * np.sin(np.pi/2 + i * 2*np.pi/3), z]) for i in range(4)]
+    pan_rad = math.radians(pan)
+    if abs(math.cos(pan_rad)) > 0.01:
+        tip_r = (tx - PAN_CENTER_X) / math.cos(pan_rad)
     else:
-        raise ValueError(f"Unknown shape: {shape}")
+        tip_r = -ty / math.sin(pan_rad)
+
+    wf = current_wf
+    delta = math.radians(A3_OFFSET + wf)
+    L_eff = math.sqrt(L2**2 + L3**2 + 2*L2*L3*math.cos(delta))
+    gamma = math.atan2(L3*math.sin(delta), L2 + L3*math.cos(delta))
+
+    dr = tip_r - PIVOT_R
+    dz = tz - PIVOT_Z
+    d = math.sqrt(dr**2 + dz**2)
+
+    max_reach = L1 + L_eff - 1
+    if d > max_reach:
+        dr *= max_reach / d
+        dz *= max_reach / d
+        d = max_reach
+
+    cos_beta = max(-1.0, min(1.0, (L1**2 + L_eff**2 - d**2) / (2*L1*L_eff)))
+    beta = math.acos(cos_beta)
+    phi = math.atan2(dz, dr)
+    cos_alpha = max(-1.0, min(1.0, (L1**2 + d**2 - L_eff**2) / (2*L1*d)))
+    alpha = math.acos(cos_alpha)
+
+    a1 = phi + alpha
+    sl = A1_BASE - math.degrees(a1)
+
+    a_eff = a1 - (math.pi - beta)
+    a2 = a_eff + gamma
+    ef = (A1_BASE - A2_OFFSET) - sl - math.degrees(a2)
+
+    return np.array([pan, sl, ef, wf, current_wr])
 
 
 # =============================================================================
 # Display
 # =============================================================================
 
-def show_status(kin, robot):
-    global _gripper_target
-    joints = get_current_joints(robot)
-    pos, T = get_ee_pose(kin, joints)
-    gripper = robot.get_observation()["gripper.pos"]
-    
-    z_axis = T[:3, 2]
-    tilt = np.degrees(np.arccos(max(-1, min(1, -z_axis[2])))) if z_axis[2] < 0 else 90
+def render_cameras(obs, joints, cam_names):
+    """Build combined camera frame with state overlay. Returns the frame or None."""
+    frames = [cv2.cvtColor(obs[n], cv2.COLOR_RGB2BGR) for n in cam_names if n in obs]
+    if not frames:
+        return None
 
-    # Gripper status with lock indicator
-    if _gripper_target is not None:
-        grip_str = f"Gripper: {gripper:.0f}% [LOCKED @ {_gripper_target:.0f}%]"
-    else:
-        grip_str = f"Gripper: {gripper:.0f}%"
+    resized = [cv2.resize(f, (320, 240)) for f in frames]
+    combined = np.hstack(resized)
 
-    print("\n" + "=" * 60)
-    print("Joints (deg):", " ".join(f"{j[:3]}={joints[i]:.1f}" for i, j in enumerate(IK_JOINTS)))
-    print(grip_str)
-    print(f"EE (mm): X={pos[0]*1000:.1f}  Y={pos[1]*1000:.1f}  Z={pos[2]*1000:.1f}  Tilt={tilt:.0f}°")
-    print("=" * 60)
+    pos = analytical_fk(joints)
+    names = ["pan", "sl", "ef", "wf", "wr"]
+    lines = [
+        f"x={pos[0]:.1f}  y={pos[1]:.1f}  z={pos[2]:.1f}",
+        "  ".join(f"{n}={joints[i]:.1f}" for i, n in enumerate(names)),
+    ]
+    for i, line in enumerate(lines):
+        cv2.putText(combined, line, (10, 25 + i * 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-
-def print_help():
-    print("""
-Commands:
-  x/y/z <mm>                 Move axis by delta
-  goto <x> <y> <z>           Move to position (mm)
-  home                       Return to home position
-  
-  draw <shape> [size] [x] [y] [z]
-                             Draw shape with gripper down
-                             Shapes: square, circle, triangle
-                             Default: 50mm at current XY, Z=-30
-  down                       Point gripper down at current XY
-  
-  g <0-100>                  Set gripper (and lock it there)
-  grip                       Show current grip target
-  release                    Release grip lock (gripper follows current pos)
-  tilt [deg]                 Set/show max tilt (default 25)
-  mode [j|c|cl]              Set motion mode:
-                               j  = joint interp (fast, curved paths)
-                               c  = cartesian interp (straight paths)
-                               cl = closed-loop (accurate, slower)
-  r                          Refresh
-  q                          Quit
-""")
+    cv2.imshow("SO101", combined)
+    cv2.waitKey(1)
+    return combined
 
 
 # =============================================================================
-# Cameras
+# Routines
 # =============================================================================
 
-_camera_stop = threading.Event()
+# Target loop rate in Hz. Controls how fast we run.
+TARGET_HZ = 20
+# Max degrees per second. Controls smoothness of motion.
+MAX_DEG_PER_SEC = 15.0
+# Convergence threshold in degrees. Servo jitter means we can't expect exact positioning.
+# Shoulder_lift under gravity can be off by ~6°, so needs to be generous.
+CONVERGE_DEG = 8.0
 
-def camera_display_loop(cam_indices):
-    """Background thread to display camera feeds."""
-    import cv2
-    caps = {}
-    for name, idx in cam_indices.items():
-        if idx is not None:
-            cap = cv2.VideoCapture(idx)
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            if cap.isOpened():
-                caps[name] = cap
-                print(f"  {name} opened (index {idx}) @ {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
-            else:
-                print(f"  {name} failed to open (index {idx})")
-    
-    while not _camera_stop.is_set():
-        for name, cap in caps.items():
-            ret, frame = cap.read()
-            if ret:
-                # Resize to 640x480 if larger
-                h, w = frame.shape[:2]
-                if w > 640 or h > 480:
-                    frame = cv2.resize(frame, (640, 480))
-                cv2.imshow(name, frame)
-        if cv2.waitKey(30) & 0xFF == ord('q'):
+
+class JointRoutine:
+    """Move joints to target with velocity-limited smooth interpolation.
+
+    Only the joints specified in `target` are moved; the rest hold their current position.
+    Limits movement speed to MAX_DEG_PER_SEC for smooth motion.
+    Applies drift correction to compensate for servo offset.
+    """
+    def __init__(self, target: dict[str, float], obs: dict, hold_s: float = 1.0):
+        self.target = {j: obs[f"{j}.pos"] for j in ALL_JOINTS}
+        self.target.update(target)
+        self.command = {j: obs[f"{j}.pos"] for j in ALL_JOINTS}  # starts at current position
+        self.hold_s = hold_s
+        self.converged_at = None
+
+    def step(self, robot, obs):
+        """Send velocity-limited action. Returns (done, action_sent)."""
+        dt = 1.0 / TARGET_HZ  # fixed dt matching our target loop rate
+        max_step = MAX_DEG_PER_SEC * dt
+
+        current = {j: obs[f"{j}.pos"] for j in ALL_JOINTS}
+
+        action = {}
+        for j in ALL_JOINTS:
+            # Move command toward target, limited by max velocity
+            diff = self.target[j] - self.command[j]
+            step = max(-max_step, min(max_step, diff))
+            self.command[j] += step
+            action[f"{j}.pos"] = self.command[j]
+
+        sent = robot.send_action(action)
+
+        max_err = max(abs(current[j] - self.target[j]) for j in ALL_JOINTS)
+        if self.converged_at is None and max_err < CONVERGE_DEG:
+            self.converged_at = time.time()
+        done = self.converged_at is not None and time.time() >= self.converged_at + self.hold_s
+        return done, sent
+
+
+class GotoRoutine:
+    """Move to a Cartesian position using IK + JointRoutine."""
+    def __init__(self, target_mm, obs):
+        joints = joints_from_obs(obs)
+        target_joints = analytical_ik(target_mm, joints[3], joints[4])
+        achieved = analytical_fk(target_joints)
+        err = np.linalg.norm(achieved - target_mm)
+        if err > 10:
+            print(f"  Warning: IK error {err:.1f}mm - may be unreachable")
+        target = {j: target_joints[k] for k, j in enumerate(IK_JOINTS)}
+        self._inner = JointRoutine(target, obs, hold_s=5.0)
+
+    def step(self, robot, obs):
+        return self._inner.step(robot, obs)
+
+
+class PolicyRoutine:
+    """Run a trained policy to control the robot. Stops after max_steps."""
+    def __init__(self, policy, preprocessor, postprocessor, max_steps=100):
+        self.policy = policy
+        self.preprocessor = preprocessor
+        self.postprocessor = postprocessor
+        self.max_steps = max_steps
+        self.step_count = 0
+        self.target = {j: 0.0 for j in ALL_JOINTS}  # for debug display
+
+    def step(self, robot, obs):
+        import torch
+        from lerobot.utils.control_utils import predict_action
+
+        # Build observation in the format the policy expects
+        state = np.array([obs[f"{j}.pos"] for j in ALL_JOINTS], dtype=np.float32)
+        policy_obs = {
+            "observation.state": state,
+            "observation.environment_state": state.copy(),
+        }
+
+        action = predict_action(
+            observation=policy_obs,
+            policy=self.policy,
+            device=torch.device(self.policy.config.device),
+            preprocessor=self.preprocessor,
+            postprocessor=self.postprocessor,
+            use_amp=False,
+        )
+        # action is a tensor — may have batch dim, squeeze it
+        action = action.squeeze()
+        action_dict = {f"{j}.pos": action[i].item() for i, j in enumerate(ALL_JOINTS)}
+        self.target = {j: action_dict[f"{j}.pos"] for j in ALL_JOINTS}
+        sent = robot.send_action(action_dict)
+        self.step_count += 1
+        done = self.step_count >= self.max_steps
+        return done, sent
+
+
+# =============================================================================
+# Run loop
+# =============================================================================
+
+def run_routine(routine, task, robot, dataset, cameras, args):
+    """Run a routine until done, optionally recording to dataset and displaying cameras."""
+    build_dataset_frame = None
+    if dataset is not None:
+        from lerobot.datasets.utils import build_dataset_frame
+
+    step_count = 0
+    t_start = time.monotonic()
+    while True:
+        t0 = time.monotonic()
+        obs = robot.get_observation()
+        done, action_sent = routine.step(robot, obs)
+
+        if dataset is not None:
+            obs_frame = build_dataset_frame(dataset.features, obs, prefix="observation")
+            act_frame = build_dataset_frame(dataset.features, action_sent, prefix="action")
+            dataset.add_frame({**obs_frame, **act_frame, "task": task})
+
+        if cameras:
+            joints = joints_from_obs(obs)
+            render_cameras(obs, joints, list(cameras))
+
+        step_count += 1
+
+        # Enforce target loop rate
+        sleep_s = (1.0 / TARGET_HZ) - (time.monotonic() - t0)
+        if sleep_s > 0:
+            time.sleep(sleep_s)
+        dt = time.monotonic() - t0
+        fps = 1.0 / dt if dt > 0 else 0
+
+        # Print status every 10 steps
+        if step_count % 10 == 0:
+            cur = {j: obs[f"{j}.pos"] for j in ALL_JOINTS}
+            tgt = routine.target if hasattr(routine, 'target') else routine._inner.target
+            errs = " ".join(f"{j[:3]}={cur[j]:+.1f}→{tgt[j]:+.1f}" for j in ALL_JOINTS)
+            max_err_j = max(ALL_JOINTS, key=lambda j: abs(cur[j] - tgt[j]))
+            max_err_v = abs(cur[max_err_j] - tgt[max_err_j])
+            elapsed = time.monotonic() - t_start
+            print(f"    step={step_count:4d}  fps={fps:4.0f}  {errs}  worst={max_err_j[:3]}({max_err_v:.1f}°)  elapsed={elapsed:.1f}s")
+
+        if done:
             break
-    
-    for cap in caps.values():
-        cap.release()
-    cv2.destroyAllWindows()
-
-
-# =============================================================================
-# Interactive mode
-# =============================================================================
-
-def run_interactive(robot):
-    kin = get_kinematics()
-    max_tilt = 25.0
-    motion_mode = "c"  # Default to cartesian interpolation
-    
-    print("\n" + "=" * 60)
-    print(" SO101 Interactive IK Control")
-    print("=" * 60)
-    print_help()
-
-    try:
-        while True:
-            show_status(kin, robot)
-            mode_names = {"j": "joint", "c": "cartesian", "cl": "closed-loop"}
-            print(f"[mode: {mode_names.get(motion_mode, motion_mode)}, tilt: {max_tilt}°]")
-            cmd = input("\n> ").strip().split()
-
-            if not cmd:
-                continue
-            c = cmd[0].lower()
-            
-            if c == "q":
-                break
-            if c == "r":
-                continue
-            if c == "help":
-                print_help()
-                continue
-
-            # Settings
-            if c == "tilt":
-                if len(cmd) >= 2:
-                    max_tilt = float(cmd[1])
-                print(f"Max tilt: {max_tilt}°")
-                continue
-            
-            if c == "mode":
-                if len(cmd) >= 2 and cmd[1] in ["j", "c", "cl"]:
-                    motion_mode = cmd[1]
-                print(f"Motion mode: {mode_names.get(motion_mode, motion_mode)}")
-                continue
-
-            # Basic movement
-            if c == "home":
-                print("Moving to home...")
-                move_smooth(robot, np.zeros(5), duration=1.5)
-                continue
-
-            # Gripper commands
-            if c == "g" and len(cmd) >= 2:
-                grip_val = float(cmd[1])
-                set_gripper_target(grip_val)
-                obs = robot.get_observation()
-                action = {f"{j}.pos": obs[f"{j}.pos"] for j in IK_JOINTS}
-                action["gripper.pos"] = grip_val
-                robot.send_action(action)
-                time.sleep(0.3)
-                print(f"Gripper locked at {grip_val:.0f}%")
-                continue
-            
-            if c == "grip":
-                if _gripper_target is not None:
-                    print(f"Gripper locked at {_gripper_target:.0f}%")
-                else:
-                    obs = robot.get_observation()
-                    print(f"Gripper unlocked (currently {obs['gripper.pos']:.0f}%)")
-                continue
-            
-            if c == "release":
-                set_gripper_target(None)
-                print("Gripper lock released - will follow current position")
-                continue
-
-            # Point down
-            if c == "down":
-                joints = get_current_joints(robot)
-                pos, _ = get_ee_pose(kin, joints)
-                target = np.array([max(pos[0], 0.18), pos[1], -0.03])
-                print(f"Pointing down at ({target[0]*1000:.0f}, {target[1]*1000:.0f}, -30)mm...")
-                
-                if motion_mode == "cl":
-                    _, err, attempts = move_corrected(robot, kin, target, solve_ik_pointing_down, 
-                                                       max_tilt_deg=max_tilt)
-                    print(f"  Final error: {err:.1f}mm ({attempts} attempts)")
-                else:
-                    new_joints, err, tilt = solve_ik_pointing_down(kin, target, max_tilt)
-                    print(f"  Planned error: {err:.1f}mm, Tilt: {tilt:.1f}°")
-                    if motion_mode == "c":
-                        move_cartesian(robot, kin, target, solve_ik_pointing_down, max_tilt_deg=max_tilt)
-                    else:
-                        move_smooth(robot, new_joints, duration=1.0)
-                continue
-
-            # Draw
-            if c == "draw":
-                shape = cmd[1] if len(cmd) >= 2 else "square"
-                size = float(cmd[2]) / 1000 if len(cmd) >= 3 else 0.05
-                
-                joints = get_current_joints(robot)
-                pos, _ = get_ee_pose(kin, joints)
-                
-                # Parse optional position args
-                cx = float(cmd[3]) / 1000 if len(cmd) >= 4 else max(pos[0], 0.18)
-                cy = float(cmd[4]) / 1000 if len(cmd) >= 5 else pos[1]
-                z = float(cmd[5]) / 1000 if len(cmd) >= 6 else -0.03
-                
-                waypoints = generate_shape(shape, cx, cy, z, size)
-                print(f"\nDrawing {shape} ({size*1000:.0f}mm) at ({cx*1000:.0f}, {cy*1000:.0f}, {z*1000:.0f})mm")
-                print(f"Mode: {mode_names.get(motion_mode, motion_mode)}")
-                
-                # Plan
-                trajectory = []
-                prev = None
-                for i, wp in enumerate(waypoints):
-                    jts, err, tilt = solve_ik_pointing_down(kin, wp, max_tilt, prev)
-                    marker = " (!)" if err > 5 else ""
-                    print(f"  WP{i}: err={err:.1f}mm tilt={tilt:.0f}°{marker}")
-                    trajectory.append((wp, jts))
-                    prev = jts
-                
-                try:
-                    input("\nEnter to execute, Ctrl+C to cancel...")
-                    
-                    for i, (wp, jts) in enumerate(trajectory):
-                        if motion_mode == "cl":
-                            _, err, attempts = move_corrected(robot, kin, wp, solve_ik_pointing_down,
-                                                               max_tilt_deg=max_tilt)
-                            print(f"  WP{i}: err={err:.1f}mm ({attempts} corrections)")
-                        elif motion_mode == "c":
-                            move_cartesian(robot, kin, wp, solve_ik_pointing_down,
-                                          duration=1.0 if i == 0 else 0.5, max_tilt_deg=max_tilt)
-                        else:
-                            move_smooth(robot, jts, duration=1.0 if i == 0 else 0.5)
-                    
-                    print("Done!")
-                except KeyboardInterrupt:
-                    print("\nCancelled")
-                continue
-
-            # Cartesian movement
-            try:
-                joints = get_current_joints(robot)
-                pos, _ = get_ee_pose(kin, joints)
-                target = pos.copy()
-
-                if c in ["x", "y", "z"] and len(cmd) >= 2:
-                    axis = {"x": 0, "y": 1, "z": 2}[c]
-                    target[axis] += float(cmd[1]) / 1000
-                elif c == "goto" and len(cmd) >= 4:
-                    target = np.array([float(cmd[1]), float(cmd[2]), float(cmd[3])]) / 1000
-                else:
-                    print("Unknown command. Type 'help' for commands.")
-                    continue
-
-                print(f"Target: ({target[0]*1000:.1f}, {target[1]*1000:.1f}, {target[2]*1000:.1f})mm")
-                
-                if motion_mode == "cl":
-                    _, err, attempts = move_corrected(robot, kin, target, solve_ik_generic)
-                    print(f"  Final error: {err:.1f}mm ({attempts} attempts)")
-                elif motion_mode == "c":
-                    move_cartesian(robot, kin, target, solve_ik_generic, duration=0.8)
-                else:
-                    new_joints = solve_ik_generic(kin, joints, target)
-                    achieved, _ = get_ee_pose(kin, new_joints)
-                    err = np.linalg.norm(achieved - target) * 1000
-                    if err > 10:
-                        print(f"Warning: Error {err:.1f}mm - may be unreachable")
-                    move_smooth(robot, new_joints, duration=0.8)
-
-            except (ValueError, IndexError) as e:
-                print(f"Error: {e}")
-
-    except KeyboardInterrupt:
-        print("\nExiting...")
 
 
 # =============================================================================
@@ -515,37 +305,168 @@ def main():
     parser = argparse.ArgumentParser(description="SO101 IK Control")
     parser.add_argument("--port", required=True, help="USB port")
     parser.add_argument("--id", default="my_awesome_follower_arm", help="Robot ID")
-    parser.add_argument("--interactive", "-i", action="store_true", help="Interactive mode")
-    parser.add_argument("--cam1", type=int, default=None, help="Camera 1 index")
-    parser.add_argument("--cam2", type=int, default=None, help="Camera 2 index")
+    parser.add_argument("--no-cameras", action="store_true", help="Disable cameras")
+    parser.add_argument("--dataset", type=str, help="Record LeRobot dataset (e.g. user/so101_goto)")
+    parser.add_argument("command", help="Command to run (goto, recover, deploy)")
+    parser.add_argument("args", nargs="*", help="Command arguments")
     args = parser.parse_args()
 
-    # Start camera thread if cameras specified
-    cam_thread = None
-    if args.cam1 is not None or args.cam2 is not None:
-        print("Starting cameras...")
-        cam_indices = {"cam1": args.cam1, "cam2": args.cam2}
-        cam_thread = threading.Thread(target=camera_display_loop, args=(cam_indices,), daemon=True)
-        cam_thread.start()
+    from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
+    from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
-    config = SO101FollowerConfig(port=args.port, id=args.id, use_degrees=True)
+    cameras = {}
+    if not args.no_cameras:
+        cameras = {name: OpenCVCameraConfig(index_or_path=c["index"], fps=c["fps"],
+                                            width=c["width"], height=c["height"])
+                   for name, c in CAMERAS.items()}
+
+    config = SO101FollowerConfig(port=args.port, id=args.id, use_degrees=True, cameras=cameras)
     robot = SO101Follower(config)
     robot.connect(calibrate=False)
 
+    # --- Dataset setup ---
+    dataset = None
+    if args.dataset:
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+        from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
+        from lerobot.datasets.utils import combine_feature_dicts
+        from lerobot.processor.factory import make_default_processors
+
+        teleop_proc, action_proc, obs_proc = make_default_processors()
+        features = combine_feature_dicts(
+            aggregate_pipeline_dataset_features(
+                pipeline=teleop_proc,
+                initial_features=create_initial_features(action=robot.action_features),
+                use_videos=bool(cameras),
+            ),
+            aggregate_pipeline_dataset_features(
+                pipeline=obs_proc,
+                initial_features=create_initial_features(observation=robot.observation_features),
+                use_videos=bool(cameras),
+            ),
+        )
+        # Add environment_state (copy of observation.state) so ACT can train without images
+        if "observation.state" in features:
+            features["observation.environment_state"] = {
+                **features["observation.state"],
+            }
+        dataset = LeRobotDataset.create(
+            repo_id=args.dataset,
+            fps=20,
+            features=features,
+            robot_type=robot.name,
+            use_videos=bool(cameras),
+            image_writer_threads=len(cameras) * 4 if cameras else 0,
+        )
+        print(f"  Dataset: {args.dataset} ({dataset.root})")
+
     try:
-        if args.interactive:
-            run_interactive(robot)
+        if args.command == "goto":
+            target = np.array([float(x) for x in args.args[:3]])
+            task = f"goto {' '.join(args.args[:3])}"
+            obs = robot.get_observation()
+            routine = GotoRoutine(target, obs)
+            run_routine(routine, task, robot, dataset, cameras, args)
+            if dataset is not None:
+                dataset.save_episode()
+
+        elif args.command == "recover":
+            n_episodes = int(args.args[0]) if args.args else 10
+            pan_min = float(args.args[1]) if len(args.args) > 1 else 10.0
+            pan_max = float(args.args[2]) if len(args.args) > 2 else 35.0
+            rng = np.random.default_rng()
+            task = "recover_pan"
+
+            for ep in range(n_episodes):
+                # Reset to home (all joints to 0) before each episode
+                print(f"  Going home...")
+                obs = robot.get_observation()
+                home = JointRoutine({j: 0.0 for j in ALL_JOINTS}, obs, hold_s=1.0)
+                run_routine(home, task, robot, None, cameras, args)
+
+                # Phase 1: move to random pan angle (not recorded)
+                angle = float(rng.uniform(pan_min, pan_max))
+                sign = rng.choice([-1, 1])
+                pan_target = sign * angle
+                print(f"  Episode {ep+1}/{n_episodes}: pan -> {pan_target:.1f}°")
+                obs = robot.get_observation()
+                setup = JointRoutine({"shoulder_pan": pan_target}, obs, hold_s=0.5)
+                run_routine(setup, task, robot, None, cameras, args)
+
+                # Phase 2: recover to center (recorded)
+                print(f"    Recording recovery: pan {pan_target:.1f}° -> 0°")
+                obs = robot.get_observation()
+                routine = JointRoutine({"shoulder_pan": 0.0}, obs, hold_s=1.0)
+                run_routine(routine, task, robot, dataset, cameras, args)
+
+                if dataset is not None:
+                    dataset.save_episode()
+                    print(f"    Saved episode {ep+1} ({dataset.num_frames} total frames)")
+
+        elif args.command == "deploy":
+            # deploy <checkpoint_path> [n_episodes] [pan_min] [pan_max]
+            if not args.args:
+                print("Usage: deploy <checkpoint_path> [n_episodes=5] [pan_min=10] [pan_max=35]")
+                return
+            checkpoint_path = args.args[0]
+            n_episodes = int(args.args[1]) if len(args.args) > 1 else 5
+            pan_min = float(args.args[2]) if len(args.args) > 2 else 10.0
+            pan_max = float(args.args[3]) if len(args.args) > 3 else 35.0
+
+            import torch
+            from lerobot.policies.act.modeling_act import ACTPolicy
+            from lerobot.policies.factory import make_pre_post_processors
+            from lerobot.policies.pretrained import PreTrainedConfig
+
+            policy_cfg = PreTrainedConfig.from_pretrained(checkpoint_path)
+            policy_cfg.pretrained_path = checkpoint_path
+            policy = ACTPolicy.from_pretrained(checkpoint_path)
+            preprocessor, postprocessor = make_pre_post_processors(
+                policy_cfg=policy_cfg,
+                pretrained_path=checkpoint_path,
+            )
+            print(f"  Loaded policy from {checkpoint_path}")
+
+            rng = np.random.default_rng()
+            task = "deploy_recover_pan"
+
+            for ep in range(n_episodes):
+                # Reset to home
+                print(f"  Going home...")
+                obs = robot.get_observation()
+                home = JointRoutine({j: 0.0 for j in ALL_JOINTS}, obs, hold_s=1.0)
+                run_routine(home, task, robot, None, cameras, args)
+
+                # Move to random pan angle
+                angle = float(rng.uniform(pan_min, pan_max))
+                sign = rng.choice([-1, 1])
+                pan_target = sign * angle
+                print(f"  Episode {ep+1}/{n_episodes}: pan -> {pan_target:.1f}°")
+                obs = robot.get_observation()
+                setup = JointRoutine({"shoulder_pan": pan_target}, obs, hold_s=0.5)
+                run_routine(setup, task, robot, None, cameras, args)
+
+                # Let policy recover
+                print(f"    Policy recovering from {pan_target:.1f}°...")
+                preprocessor.reset()
+                postprocessor.reset()
+                routine = PolicyRoutine(policy, preprocessor, postprocessor, max_steps=60)
+                run_routine(routine, task, robot, None, cameras, args)
+
+                # Check result
+                obs = robot.get_observation()
+                final_pan = obs["shoulder_pan.pos"]
+                print(f"    Result: pan={final_pan:+.1f}° (target=0.0°, error={abs(final_pan):.1f}°)")
+
         else:
-            # Default: show status
-            kin = get_kinematics()
-            show_status(kin, robot)
-            print("\nUse --interactive (-i) for control mode")
+            print(f"Unknown command '{args.command}'. Available: goto, recover, deploy")
     finally:
-        _camera_stop.set()
-        if cam_thread:
-            cam_thread.join(timeout=1.0)
+        if dataset is not None:
+            print(f"  Dataset done: {dataset.num_episodes} episode(s), {dataset.num_frames} frame(s)")
+        if cameras:
+            cv2.destroyAllWindows()
         robot.disconnect()
-        print("\nDisconnected.")
+        print("Disconnected.")
 
 
 if __name__ == "__main__":
