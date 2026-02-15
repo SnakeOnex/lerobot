@@ -5,10 +5,12 @@ SO101 Inverse Kinematics Control - Move the arm using Cartesian positions.
 Usage:
     python scripts/test_so101_ik.py --port /dev/ttyACM0
     python scripts/test_so101_ik.py --port /dev/ttyACM0 --interactive
+    python scripts/test_so101_ik.py --port /dev/ttyACM0 -i --cam1 0 --cam2 2
 """
 
 import argparse
 import time
+import threading
 
 import numpy as np
 
@@ -288,6 +290,44 @@ Commands:
 
 
 # =============================================================================
+# Cameras
+# =============================================================================
+
+_camera_stop = threading.Event()
+
+def camera_display_loop(cam_indices):
+    """Background thread to display camera feeds."""
+    import cv2
+    caps = {}
+    for name, idx in cam_indices.items():
+        if idx is not None:
+            cap = cv2.VideoCapture(idx)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            if cap.isOpened():
+                caps[name] = cap
+                print(f"  {name} opened (index {idx}) @ {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
+            else:
+                print(f"  {name} failed to open (index {idx})")
+    
+    while not _camera_stop.is_set():
+        for name, cap in caps.items():
+            ret, frame = cap.read()
+            if ret:
+                # Resize to 640x480 if larger
+                h, w = frame.shape[:2]
+                if w > 640 or h > 480:
+                    frame = cv2.resize(frame, (640, 480))
+                cv2.imshow(name, frame)
+        if cv2.waitKey(30) & 0xFF == ord('q'):
+            break
+    
+    for cap in caps.values():
+        cap.release()
+    cv2.destroyAllWindows()
+
+
+# =============================================================================
 # Interactive mode
 # =============================================================================
 
@@ -476,7 +516,17 @@ def main():
     parser.add_argument("--port", required=True, help="USB port")
     parser.add_argument("--id", default="my_awesome_follower_arm", help="Robot ID")
     parser.add_argument("--interactive", "-i", action="store_true", help="Interactive mode")
+    parser.add_argument("--cam1", type=int, default=None, help="Camera 1 index")
+    parser.add_argument("--cam2", type=int, default=None, help="Camera 2 index")
     args = parser.parse_args()
+
+    # Start camera thread if cameras specified
+    cam_thread = None
+    if args.cam1 is not None or args.cam2 is not None:
+        print("Starting cameras...")
+        cam_indices = {"cam1": args.cam1, "cam2": args.cam2}
+        cam_thread = threading.Thread(target=camera_display_loop, args=(cam_indices,), daemon=True)
+        cam_thread.start()
 
     config = SO101FollowerConfig(port=args.port, id=args.id, use_degrees=True)
     robot = SO101Follower(config)
@@ -491,6 +541,9 @@ def main():
             show_status(kin, robot)
             print("\nUse --interactive (-i) for control mode")
     finally:
+        _camera_stop.set()
+        if cam_thread:
+            cam_thread.join(timeout=1.0)
         robot.disconnect()
         print("\nDisconnected.")
 
